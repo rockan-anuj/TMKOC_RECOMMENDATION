@@ -33,9 +33,7 @@ def get_recommendations():
     for idx, num in enumerate(ep_numbers):
         score = similarities[idx]
 
-        # --- NEW: The New Era Penalty ---
-        # If the episode is > 3000, subtract a massive 0.4 from its score.
-        # This pushes them to the bottom of the database natively.
+        # --- The Era Penalty ---
         if num.isdigit() and int(num) > 3100:
             score -= 0.4
         if num.isdigit() and int(num) > 2100:
@@ -46,7 +44,7 @@ def get_recommendations():
             if int(num) == int(last_watched_ep) + 1:
                 score += 0.8
 
-                # View Penalty
+        # View Penalty (Fixed indentation here so it applies to all episodes!)
         views = watch_counts.get(num, 0)
         if views > 0:
             score -= (views * 0.3)
@@ -69,7 +67,6 @@ def get_recommendations():
     sour_mix = []
     if unwatched_pool:
         safe_unwatched = [ep for ep in unwatched_pool if ep not in top_smart_recommendations]
-        # Make sure our "sour mix" wildcards also strictly ignore episodes > 3000
         safe_unwatched_classic = [ep for ep in safe_unwatched if ep.isdigit() and int(ep) <= 3000]
 
         if safe_unwatched_classic:
@@ -81,14 +78,22 @@ def get_recommendations():
     results = []
     for num in final_playlist_numbers:
         ep = official_data[num]
+
+        # Calculate the smart reason
         reason = "Next in sequence" if (last_watched_ep and str(num) == str(int(last_watched_ep) + 1)) else \
             "Something totally new" if num in sour_mix else \
                 "Because you might like it"
 
+        # Output the exact format matching your official JSON, plus our custom 'reason'
         results.append({
-            "episode_number": ep["number"],
-            "title": ep["name"],
+            "name": ep.get("name", ""),
+            "number": ep.get("number", ""),
+            "id": ep.get("id", ""),
             "thumbnail": ep.get("thumbnail", ""),
+            "description": ep.get("description", ""),
+            "sprite": ep.get("sprite", ""),
+            "duration": ep.get("duration", ""),
+            "date": ep.get("date", ""),
             "reason": reason
         })
 
