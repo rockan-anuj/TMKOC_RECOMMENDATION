@@ -1,27 +1,59 @@
+import os
 import pickle
 import random
+import json
 import numpy as np
+import redis
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sklearn.metrics.pairwise import cosine_similarity
 
 app = FastAPI()
 
+kv_url = os.getenv("KV_URL", "redis://localhost:6379")
+redis_client = redis.Redis.from_url(kv_url)
+
 with open('trained_brain.pkl', 'rb') as f:
     brain = pickle.load(f)
 
 official_data = brain["official_data"]
-taste_profile = brain["taste_profile"]
-watch_counts = brain["watch_counts"]
-last_watched_ep = brain["last_watched_ep"]
 
 
 class UpdateRequest(BaseModel):
     episode_number: str
 
 
+# Helper function to get the latest dynamic state from Redis
+def get_dynamic_state():
+    taste_data = redis_client.get("taste_profile")
+
+    if taste_data:
+        # Load from Redis
+        taste_profile = np.array(json.loads(taste_data))
+        watch_counts = json.loads(redis_client.get("watch_counts"))
+        last_watched = redis_client.get("last_watched_ep")
+        if last_watched:
+            last_watched = last_watched.decode('utf-8')
+    else:
+        # First time running! Seed Redis with the original data from train.py
+        taste_profile = brain["taste_profile"]
+        watch_counts = brain["watch_counts"]
+        last_watched = brain["last_watched_ep"]
+
+        # Save to Redis for next time
+        redis_client.set("taste_profile", json.dumps(taste_profile.tolist()))
+        redis_client.set("watch_counts", json.dumps(watch_counts))
+        if last_watched:
+            redis_client.set("last_watched_ep", last_watched)
+
+    return taste_profile, watch_counts, last_watched
+
+
 @app.get("/recommend")
 def get_recommendations():
+    # Always fetch the freshest memory from the cloud
+    taste_profile, watch_counts, last_watched_ep = get_dynamic_state()
+
     ep_numbers = list(official_data.keys())
     embeddings = [official_data[num]['embedding'] for num in ep_numbers]
 
@@ -33,7 +65,7 @@ def get_recommendations():
     for idx, num in enumerate(ep_numbers):
         score = similarities[idx]
 
-        # --- The Era Penalty ---
+        # The Era Penalty
         if num.isdigit() and int(num) > 3100:
             score -= 0.4
         if num.isdigit() and int(num) > 2100:
@@ -44,7 +76,7 @@ def get_recommendations():
             if int(num) == int(last_watched_ep) + 1:
                 score += 0.8
 
-        # View Penalty (Fixed indentation here so it applies to all episodes!)
+        # View Penalty
         views = watch_counts.get(num, 0)
         if views > 0:
             score -= (views * 0.3)
@@ -79,12 +111,10 @@ def get_recommendations():
     for num in final_playlist_numbers:
         ep = official_data[num]
 
-        # Calculate the smart reason
         reason = "Next in sequence" if (last_watched_ep and str(num) == str(int(last_watched_ep) + 1)) else \
             "Something totally new" if num in sour_mix else \
                 "Because you might like it"
 
-        # Output the exact format matching your official JSON, plus our custom 'reason'
         results.append({
             "name": ep.get("name", ""),
             "number": ep.get("number", ""),
@@ -102,28 +132,24 @@ def get_recommendations():
 
 @app.post("/update")
 def update_history(data: UpdateRequest):
-    global taste_profile, last_watched_ep
+    # Fetch current state from the cloud
+    taste_profile, watch_counts, last_watched_ep = get_dynamic_state()
 
     ep_num = str(data.episode_number)
     if ep_num not in official_data:
         return {"error": "Episode not found"}
 
+    # Update logic
     watch_counts[ep_num] = watch_counts.get(ep_num, 0) + 1
-    last_watched_ep = ep_num
-
     ep_embedding = official_data[ep_num]['embedding']
     taste_profile = (taste_profile * 0.9) + (ep_embedding * 0.1)
 
-    updated_brain = {
-        "official_data": official_data,
-        "taste_profile": taste_profile,
-        "watch_counts": watch_counts,
-        "last_watched_ep": last_watched_ep
-    }
-    with open('trained_brain.pkl', 'wb') as f:
-        pickle.dump(updated_brain, f)
+    # Push the new state back to Vercel KV
+    redis_client.set("taste_profile", json.dumps(taste_profile.tolist()))
+    redis_client.set("watch_counts", json.dumps(watch_counts))
+    redis_client.set("last_watched_ep", ep_num)
 
-    return {"status": "success"}
+    return {"status": "success", "message": "Memory updated in the cloud."}
 
 
 if __name__ == "__main__":
