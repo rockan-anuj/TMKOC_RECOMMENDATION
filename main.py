@@ -10,7 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 app = FastAPI()
 
-kv_url = os.getenv("KV_URL", "redis://localhost:6379")
+kv_url = os.getenv("REDIS_URL", "redis://localhost:6379")
 redis_client = redis.Redis.from_url(kv_url)
 
 with open('trained_brain.pkl', 'rb') as f:
