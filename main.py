@@ -15,7 +15,7 @@ def load_data():
     if not OFFICIAL_DATA:
         try:
             # Assuming merged.json is in your root directory
-            with open("merged.json", "r", encoding="utf-8") as f:
+            with open("official_episodes.json", "r", encoding="utf-8") as f:
                 OFFICIAL_DATA = json.load(f)
         except Exception as e:
             print(f"Error loading JSON: {e}")
