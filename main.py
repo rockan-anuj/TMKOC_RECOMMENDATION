@@ -2,68 +2,152 @@ import os
 import pickle
 import random
 import json
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import redis
 from fastapi import FastAPI
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from sklearn.metrics.pairwise import cosine_similarity
-from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
+
 app = FastAPI()
 
 kv_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-redis_client = redis.Redis.from_url(kv_url)
 
-with open('trained_brain.pkl', 'rb') as f:
-    brain = pickle.load(f)
+# Redis client is initialized lazily to avoid slow or hanging startup
+_redis_client: Optional[redis.Redis] = None
 
-official_data = brain["official_data"]
+
+def get_redis_client() -> Optional[redis.Redis]:
+    """
+    Lazily create a Redis client with short timeouts so the
+    serverless function never hangs waiting on the network.
+    """
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+
+    try:
+        _redis_client = redis.Redis.from_url(
+            kv_url,
+            socket_connect_timeout=1.0,
+            socket_timeout=1.0,
+            health_check_interval=30,
+        )
+    except redis.RedisError:
+        _redis_client = None
+
+    return _redis_client
+
+
+# Heavy model / data is loaded once and reused across invocations
+brain: Optional[Dict] = None
+official_data: Dict = {}
+_episode_numbers: List[str] = []
+_embeddings_matrix: Optional[np.ndarray] = None
+
+
+def load_brain() -> None:
+    """
+    Load the trained brain and precompute static structures.
+    Called lazily on first use to keep cold starts minimal.
+    """
+    global brain, official_data, _episode_numbers, _embeddings_matrix
+    if brain is not None:
+        return
+
+    with open("trained_brain.pkl", "rb") as f:
+        brain_loaded = pickle.load(f)
+
+    brain = brain_loaded
+    official = brain_loaded["official_data"]
+    official_data.update(official)
+
+    # Precompute episode numbers and embedding matrix (read‑only across requests)
+    _episode_numbers = list(official_data.keys())
+    _embeddings_matrix = np.array(
+        [official_data[num]["embedding"] for num in _episode_numbers], dtype=float
+    )
 
 
 class UpdateRequest(BaseModel):
     episode_number: str
 
 
-# Helper function to get the latest dynamic state from Redis
-def get_dynamic_state():
-    taste_data = redis_client.get("taste_profile")
+def _fallback_state_from_brain() -> Tuple[np.ndarray, Dict[str, int], Optional[str]]:
+    load_brain()
+    assert brain is not None  # for type‑checkers
+    taste_profile = brain["taste_profile"]
+    watch_counts = brain["watch_counts"]
+    last_watched = brain["last_watched_ep"]
+    return taste_profile, watch_counts, last_watched
+
+
+def get_dynamic_state() -> Tuple[np.ndarray, Dict[str, int], Optional[str]]:
+    """
+    Get the latest dynamic state from Redis.
+    Falls back to the bundled brain data instantly if Redis is slow or unavailable.
+    """
+    client = get_redis_client()
+    if client is None:
+        return _fallback_state_from_brain()
+
+    try:
+        taste_data = client.get("taste_profile")
+    except redis.RedisError:
+        return _fallback_state_from_brain()
 
     if taste_data:
-        # Load from Redis
-        taste_profile = np.array(json.loads(taste_data))
-        watch_counts = json.loads(redis_client.get("watch_counts"))
-        last_watched = redis_client.get("last_watched_ep")
-        if last_watched:
-            last_watched = last_watched.decode('utf-8')
-    else:
-        # First time running! Seed Redis with the original data from train.py
-        taste_profile = brain["taste_profile"]
-        watch_counts = brain["watch_counts"]
-        last_watched = brain["last_watched_ep"]
+        try:
+            taste_profile = np.array(json.loads(taste_data))
+            watch_counts_raw = client.get("watch_counts")
+            watch_counts: Dict[str, int] = (
+                json.loads(watch_counts_raw) if watch_counts_raw else {}
+            )
+            last_watched_raw = client.get("last_watched_ep")
+            last_watched = (
+                last_watched_raw.decode("utf-8") if last_watched_raw else None
+            )
+            return taste_profile, watch_counts, last_watched
+        except (ValueError, TypeError, redis.RedisError):
+            # Corrupt or unexpected data, fall back to safe defaults
+            return _fallback_state_from_brain()
 
-        # Save to Redis for next time
-        redis_client.set("taste_profile", json.dumps(taste_profile.tolist()))
-        redis_client.set("watch_counts", json.dumps(watch_counts))
+    # First time running or empty KV: seed from bundled brain
+    taste_profile, watch_counts, last_watched = _fallback_state_from_brain()
+
+    try:
+        client.set("taste_profile", json.dumps(taste_profile.tolist()))
+        client.set("watch_counts", json.dumps(watch_counts))
         if last_watched:
-            redis_client.set("last_watched_ep", last_watched)
+            client.set("last_watched_ep", last_watched)
+    except redis.RedisError:
+        # If caching fails, we still return a valid in‑memory state
+        pass
 
     return taste_profile, watch_counts, last_watched
 
 
 @app.get("/recommend")
-def get_recommendations():
-    # Always fetch the freshest memory from the cloud
+async def get_recommendations():
+    # Always fetch the freshest memory from the cloud (or safe fallback)
     taste_profile, watch_counts, last_watched_ep = get_dynamic_state()
 
-    ep_numbers = list(official_data.keys())
-    embeddings = [official_data[num]['embedding'] for num in ep_numbers]
+    # Ensure brain and static embeddings are initialized
+    load_brain()
+    ep_numbers_local = _episode_numbers
+    embeddings_matrix = _embeddings_matrix
 
-    similarities = cosine_similarity([taste_profile], embeddings)[0]
+    similarities = cosine_similarity(
+        [taste_profile],
+        embeddings_matrix,
+    )[0]
 
     scores = {}
     unwatched_pool = []
 
-    for idx, num in enumerate(ep_numbers):
+    for idx, num in enumerate(ep_numbers_local):
         score = similarities[idx]
 
         # The Era Penalty
@@ -108,7 +192,7 @@ def get_recommendations():
     final_playlist_numbers = top_smart_recommendations + sour_mix
     random.shuffle(final_playlist_numbers)
 
-    results = []
+    results: List[Dict] = []
     for num in final_playlist_numbers:
         ep = official_data[num]
 
@@ -132,8 +216,8 @@ def get_recommendations():
 
 
 @app.post("/update")
-def update_history(data: UpdateRequest):
-    # Fetch current state from the cloud
+async def update_history(data: UpdateRequest):
+    # Fetch current state from the cloud (or safe fallback)
     taste_profile, watch_counts, last_watched_ep = get_dynamic_state()
 
     ep_num = str(data.episode_number)
@@ -142,13 +226,21 @@ def update_history(data: UpdateRequest):
 
     # Update logic
     watch_counts[ep_num] = watch_counts.get(ep_num, 0) + 1
-    ep_embedding = official_data[ep_num]['embedding']
+    # Ensure brain and static data are initialized
+    load_brain()
+    ep_embedding = official_data[ep_num]["embedding"]
     taste_profile = (taste_profile * 0.9) + (ep_embedding * 0.1)
 
-    # Push the new state back to Vercel KV
-    redis_client.set("taste_profile", json.dumps(taste_profile.tolist()))
-    redis_client.set("watch_counts", json.dumps(watch_counts))
-    redis_client.set("last_watched_ep", ep_num)
+    # Push the new state back to Redis / KV without blocking the request on failures
+    client = get_redis_client()
+    if client is not None:
+        try:
+            client.set("taste_profile", json.dumps(taste_profile.tolist()))
+            client.set("watch_counts", json.dumps(watch_counts))
+            client.set("last_watched_ep", ep_num)
+        except redis.RedisError:
+            # Ignore persistence failures to avoid user‑visible errors
+            pass
 
     return {"status": "success", "message": "Memory updated in the cloud."}
 
