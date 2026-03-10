@@ -6,4 +6,3 @@ scikit-learn~=1.8.0
 redis
 pandas~=3.0.1
 sentence-transformers~=5.2.3
-starlette~=0.52.1
