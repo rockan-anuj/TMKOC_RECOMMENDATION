@@ -9,7 +9,6 @@ import redis
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
-from sklearn.metrics.pairwise import cosine_similarity
 
 app = FastAPI()
 
@@ -45,6 +44,7 @@ def get_redis_client() -> Optional[redis.Redis]:
 brain: Optional[Dict] = None
 official_data: Dict = {}
 _episode_numbers: List[str] = []
+_episode_numbers_int: List[Optional[int]] = []
 _embeddings_matrix: Optional[np.ndarray] = None
 
 
@@ -53,7 +53,7 @@ def load_brain() -> None:
     Load the trained brain and precompute static structures.
     Called lazily on first use to keep cold starts minimal.
     """
-    global brain, official_data, _episode_numbers, _embeddings_matrix
+    global brain, official_data, _episode_numbers, _episode_numbers_int, _embeddings_matrix
     if brain is not None:
         return
 
@@ -64,11 +64,43 @@ def load_brain() -> None:
     official = brain_loaded["official_data"]
     official_data.update(official)
 
-    # Precompute episode numbers and embedding matrix (read‑only across requests)
+    # Precompute episode numbers, their integer forms, and embedding matrix (read‑only across requests)
     _episode_numbers = list(official_data.keys())
+    _episode_numbers_int = [int(n) if n.isdigit() else None for n in _episode_numbers]
     _embeddings_matrix = np.array(
         [official_data[num]["embedding"] for num in _episode_numbers], dtype=float
     )
+
+
+def _compute_cosine_similarities(taste_profile: np.ndarray) -> np.ndarray:
+    """
+    Lightweight cosine similarity implementation using NumPy only.
+    This avoids pulling in heavy ML dependencies at runtime while
+    keeping the recommendation logic equivalent.
+    """
+    load_brain()
+    if _embeddings_matrix is None:
+        return np.zeros(0, dtype=float)
+
+    # Ensure 1D float array
+    tp = np.asarray(taste_profile, dtype=float).ravel()
+    emb = _embeddings_matrix
+
+    # Handle degenerate cases defensively
+    tp_norm = np.linalg.norm(tp)
+    if tp_norm == 0.0:
+        return np.zeros(emb.shape[0], dtype=float)
+
+    emb_norms = np.linalg.norm(emb, axis=1)
+    # Avoid division by zero; zero‑norm embeddings contribute zero similarity
+    safe_norms = emb_norms.copy()
+    safe_norms[safe_norms == 0.0] = 1.0
+
+    dots = emb @ tp
+    sims = dots / (tp_norm * safe_norms)
+    # Any embeddings that were actually zero‑norm should be forced to 0 similarity
+    sims[emb_norms == 0.0] = 0.0
+    return sims
 
 
 class UpdateRequest(BaseModel):
@@ -100,7 +132,7 @@ def get_dynamic_state() -> Tuple[np.ndarray, Dict[str, int], Optional[str]]:
 
     if taste_data:
         try:
-            taste_profile = np.array(json.loads(taste_data))
+            taste_profile = np.array(json.loads(taste_data), dtype=float)
             watch_counts_raw = client.get("watch_counts")
             watch_counts: Dict[str, int] = (
                 json.loads(watch_counts_raw) if watch_counts_raw else {}
@@ -129,7 +161,7 @@ def get_dynamic_state() -> Tuple[np.ndarray, Dict[str, int], Optional[str]]:
     return taste_profile, watch_counts, last_watched
 
 
-@app.get("/recommend")
+@app.post("/recommend")
 async def get_recommendations():
     # Always fetch the freshest memory from the cloud (or safe fallback)
     taste_profile, watch_counts, last_watched_ep = get_dynamic_state()
@@ -137,28 +169,26 @@ async def get_recommendations():
     # Ensure brain and static embeddings are initialized
     load_brain()
     ep_numbers_local = _episode_numbers
-    embeddings_matrix = _embeddings_matrix
+    ep_numbers_int_local = _episode_numbers_int
 
-    similarities = cosine_similarity(
-        [taste_profile],
-        embeddings_matrix,
-    )[0]
+    similarities = _compute_cosine_similarities(taste_profile)
 
     scores = {}
     unwatched_pool = []
 
     for idx, num in enumerate(ep_numbers_local):
+        num_int = ep_numbers_int_local[idx]
         score = similarities[idx]
 
         # The Era Penalty
-        if num.isdigit() and int(num) > 3100:
+        if num_int is not None and num_int > 3100:
             score -= 0.4
-        if num.isdigit() and int(num) > 2100:
+        if num_int is not None and num_int > 2100:
             score -= 0.1
 
         # Sequential Boost
-        if last_watched_ep and num.isdigit() and last_watched_ep.isdigit():
-            if int(num) == int(last_watched_ep) + 1:
+        if last_watched_ep and last_watched_ep.isdigit() and num_int is not None:
+            if num_int == int(last_watched_ep) + 1:
                 score += 0.8
 
         # View Penalty
