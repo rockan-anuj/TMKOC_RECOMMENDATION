@@ -92,10 +92,6 @@ if "streamlit" in sys.modules:
     st.divider()
     st.markdown("Use **GET/POST** `/recommend` on this app for JSON API (e.g. from Android).")
 
-if __name__ == "__main__":
-    # Only start FastAPI server when run as "python main.py", NOT when run by "streamlit run main.py"
-    if "streamlit" not in sys.modules:
-        import uvicorn
-
-        port = int(os.environ.get("PORT", "8000"))
-        uvicorn.run(app, host="0.0.0.0", port=port)
+# Do NOT start uvicorn from this file. Streamlit Cloud runs "streamlit run main.py" and
+# would hit "address already in use" if we started uvicorn here. To run the API locally:
+#   uvicorn main:app --host 0.0.0.0 --port 8000
