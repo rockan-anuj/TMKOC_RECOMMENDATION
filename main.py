@@ -3,7 +3,7 @@ import sys
 import json
 import random
 from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse
 
 app = FastAPI()
 
@@ -11,10 +11,64 @@ app = FastAPI()
 OFFICIAL_DATA = []
 
 
-@app.get("/")
+def _index_html() -> str:
+    """Simple UI + API links. Same origin so /token and /recommend work when hosted as FastAPI."""
+    return """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TMKOC Recommendations</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { color: #333; }
+    button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
+    #out { margin-top: 1rem; }
+    .ep { margin: 0.4rem 0; padding: 0.4rem; background: #f5f5f5; border-radius: 6px; }
+    .links { margin-top: 1.5rem; font-size: 0.9rem; color: #666; }
+    .links a { color: #1a73e8; }
+  </style>
+</head>
+<body>
+  <h1>Taarak Mehta Ka Oolta Chashmah</h1>
+  <p>Episode recommendations</p>
+  <button id="btn">Get recommendations</button>
+  <div id="out"></div>
+  <div class="links">
+    <p><strong>API (same host):</strong></p>
+    <p><a href="/recommend" target="_blank">GET /recommend</a> — JSON recommendations</p>
+    <p><a href="/token" target="_blank">GET /token</a> — token (e.g. for Android)</p>
+    <p><a href="/health" target="_blank">GET /health</a> — health check</p>
+  </div>
+  <script>
+    document.getElementById('btn').onclick = async () => {
+      const out = document.getElementById('out');
+      out.innerHTML = 'Loading...';
+      try {
+        const r = await fetch('/recommend');
+        const j = await r.json();
+        const list = j.recommendations || [];
+        out.innerHTML = list.length ? list.slice(0, 15).map(ep =>
+          '<div class="ep"><b>' + (ep.number || '') + '</b> — ' + (ep.name || '') + ' <small>(' + (ep.reason || '') + ')</small></div>'
+        ).join('') + (list.length > 15 ? '<p>... and ' + (list.length - 15) + ' more.</p>' : '') : '<p>No data.</p>';
+      } catch (e) {
+        out.innerHTML = '<p style="color:red">Error: ' + e.message + '</p>';
+      }
+    };
+  </script>
+</body>
+</html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    """Serve minimal UI. /token and /recommend work on this same host when you deploy FastAPI (e.g. Render)."""
+    return _index_html()
+
+
 @app.get("/health")
 def health():
-    """Used by platforms (Render, Netlify, etc.) for health checks. Must return 200."""
+    """Health check for platforms."""
     return {"status": "ok"}
 
 
