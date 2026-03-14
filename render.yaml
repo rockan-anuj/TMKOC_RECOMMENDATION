@@ -1,0 +1,9 @@
+# Streamlit deployment. Health checks MUST use Streamlit's path or you get 404.
+
+services:
+  - type: web
+    name: tmkoc-yt
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
+    healthCheckPath: /_stcore/health
